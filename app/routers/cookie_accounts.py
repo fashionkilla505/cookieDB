@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.models.cookie_accounts import CookieAccount
+from app.models.vps_node import VPSNode
+
 from app.schemas.cookie_accounts import (
     CookieAccountCreate,
     CookieAccountUpdate,
@@ -20,10 +22,9 @@ from app.schemas.cookie_accounts import (
 )
 from app.utils.crypto import encrypt_text, decrypt_text
 from app.dependencies import get_db
-from app.services.cookie_checker import (
-    collect_checker_results,
-    apply_checker_results_to_db,
-)
+    
+from app.services.cookie_checker import run_cookie_checker
+
 
 router = APIRouter(prefix="/cookie-accounts", tags=["cookie-accounts"])
 
@@ -51,7 +52,7 @@ def _decrypt_row(row: CookieAccount):
 
 # ---- Endpoints ----
 
-@router.get("/", response_model=List[CookieAccountOut])
+@router.get("/cookie", response_model=List[CookieAccountOut])
 def list_cookie_accounts(
     status: Optional[str] = Query(None),
     vps_node: Optional[str] = Query(None),
@@ -67,7 +68,7 @@ def list_cookie_accounts(
     return result
 
 
-@router.post("/", response_model=CookieAccountOut)
+@router.post("/cookie", response_model=CookieAccountOut)
 def create_or_upsert_cookie_account(
     payload: CookieAccountCreate,
     db: Session = Depends(get_db),
@@ -98,7 +99,6 @@ def create_or_upsert_cookie_account(
         vps_node=payload.vps_node,
         note=payload.note,
         stock=payload.stock,
-        # first_seen auto by DB
     )
     db.add(obj)
     db.commit()
@@ -106,7 +106,7 @@ def create_or_upsert_cookie_account(
     return obj
 
 
-@router.patch("/{username}", response_model=CookieAccountOut)
+@router.patch("/cookie/{username}", response_model=CookieAccountOut)
 def update_cookie_account(
     username: str,
     payload: CookieAccountUpdate,
@@ -116,25 +116,22 @@ def update_cookie_account(
     if not acc:
         raise HTTPException(status_code=404, detail="Cookie account not found")
 
-    # password & cookie
     if payload.password is not None:
         acc.pass_enc = encrypt_text(payload.password)
 
     if payload.cookie is not None:
         acc.cookie_enc = encrypt_text(payload.cookie)
 
-    # status and vps
     if payload.status is not None:
         acc.status = payload.status
 
     if payload.vps_node is not None:
         acc.vps_node = payload.vps_node
 
-    # note
     if payload.note is not None:
         acc.note = payload.note
 
-    # stock (only allowed when status is "done")
+    # stock can only be set when status is "done"
     if payload.stock is not None:
         final_status = payload.status if payload.status is not None else acc.status
         if final_status != "done":
@@ -148,6 +145,71 @@ def update_cookie_account(
     db.commit()
     db.refresh(acc)
     return acc
+
+@router.get("/cookie/{username}", response_model=CookieAccountOut)
+def get_cookie_account(
+    username: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna todos os dados da conta especificada pelo username.
+    """
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+    return acc
+
+## --- setar o status da conta
+
+# -- set DONE
+@router.patch("/cookie/set-done/{username}", response_model=CookieAccountOut)
+def set_cookie_done(
+    username: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Marca a conta especificada como 'done'.
+    Usado pela API externa para indicar finalização do kaitun.
+    """
+
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+
+    acc.status = "done"
+
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return acc
+
+
+# --- set stock
+
+class StockUpdate(BaseModel):
+    stock: int | str
+@router.patch("/cookie/set-stock/{username}", response_model=CookieAccountOut)
+def update_stock_single(
+    username: str,
+    payload: StockUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza apenas o campo 'stock' de uma conta específica.
+    Usado para registrar quantidade/estoque/valor do item gerado pela conta.
+    """
+
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+
+    acc.stock = payload.stock
+
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return acc
+
 
 
 # --- EXPORT: per VPS (for deploying to each node) ---
@@ -183,17 +245,15 @@ def export_for_vps(
 
 @router.get("/export/dead", response_class=PlainTextResponse)
 def export_dead_cookies(
-    vps_node: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """
-    Export `username:password:cookie` for status = dead (optionally filtered by vps_node).
+    Export ALL `username:password:cookie` with status = dead.
+    Independent of vps_node.
     """
     stmt = select(CookieAccount).where(CookieAccount.status == "dead")
-    if vps_node:
-        stmt = stmt.where(CookieAccount.vps_node == vps_node)
-
     rows = db.scalars(stmt).all()
+
     lines = []
     for row in rows:
         username, password, cookie = _decrypt_row(row)
@@ -202,6 +262,47 @@ def export_dead_cookies(
         lines.append(f"{username}:{password}:{cookie}")
 
     return "\n".join(lines)
+
+@router.get("/export/live", response_class=PlainTextResponse)
+def export_dead_cookies(
+    db: Session = Depends(get_db),
+):
+    """
+    Export ALL `username:password:cookie` with status = live.
+    Independent of vps_node.
+    """
+    stmt = select(CookieAccount).where(CookieAccount.status == "live")
+    rows = db.scalars(stmt).all()
+
+    lines = []
+    for row in rows:
+        username, password, cookie = _decrypt_row(row)
+        if not username or not cookie:
+            continue
+        lines.append(f"{username}:{password}:{cookie}")
+
+    return "\n".join(lines)
+
+@router.get("/export/locked", response_class=PlainTextResponse)
+def export_dead_cookies(
+    db: Session = Depends(get_db),
+):
+    """
+    Export ALL `username:password:cookie` with status = locked.
+    Independent of vps_node.
+    """
+    stmt = select(CookieAccount).where(CookieAccount.status == "locked")
+    rows = db.scalars(stmt).all()
+
+    lines = []
+    for row in rows:
+        username, password, cookie = _decrypt_row(row)
+        if not username or not cookie:
+            continue
+        lines.append(f"{username}:{password}:{cookie}")
+
+    return "\n".join(lines)
+
 
 
 # --- Bulk checker results (manual JSON push from some tool, if needed) ---
@@ -225,8 +326,106 @@ def apply_check_results(
 
 # --- Bulk refresh (new cookies from Discord bot /login) ---
 
-@router.post("/refresh")
-def bulk_refresh_cookies(
+from fastapi import Body
+
+@router.post("/refresh", response_model=dict)
+def refresh_from_txt(
+    raw_text: str = Body(..., media_type="text/plain"),
+    db: Session = Depends(get_db),
+):
+    """
+    Refresh cookies from raw TXT.
+    Format required:
+        username:password:cookie
+    """
+
+    inserted = 0
+    updated = 0
+    ignored_duplicates = 0
+    errors = []
+
+    processed_usernames = set()
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    for idx, line in enumerate(lines, start=1):
+        # -------------------------------
+        # Duplicate line check
+        # -------------------------------
+        if line in processed_usernames:
+            ignored_duplicates += 1
+            continue
+        processed_usernames.add(line)
+
+        # -------------------------------
+        # Format validation
+        # -------------------------------
+        parts = line.split(":")
+
+        if len(parts) < 3:
+            errors.append(
+                {"line": idx, "content": line, "error": "Invalid format (expected username:password:cookie)"}
+            )
+            continue
+
+        username = parts[0].strip()
+        password = parts[1].strip()
+        cookie = ":".join(parts[2:]).strip()  # cookie can include extra ':' safely
+
+        # -------------------------------
+        # Field validation
+        # -------------------------------
+        if not username:
+            errors.append({"line": idx, "content": line, "error": "Missing username"})
+            continue
+
+        if not password:
+            errors.append({"line": idx, "content": line, "error": "Missing password"})
+            continue
+
+        if not cookie:
+            errors.append({"line": idx, "content": line, "error": "Missing cookie"})
+            continue
+
+        # -------------------------------
+        # Process normal refresh logic
+        # -------------------------------
+        acc = _get_account_by_username(db, username)
+        pass_enc = encrypt_text(password)
+        cookie_enc = encrypt_text(cookie)
+
+        final_status = "live"
+
+        if acc:
+            acc.pass_enc = pass_enc
+            acc.cookie_enc = cookie_enc
+            acc.status = final_status
+            db.add(acc)
+            updated += 1
+        else:
+            acc = CookieAccount(
+                username=username,
+                pass_enc=pass_enc,
+                cookie_enc=cookie_enc,
+                status=final_status,
+                note="",
+                vps_node=None,
+            )
+            db.add(acc)
+            inserted += 1
+
+    db.commit()
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "ignored_duplicates": ignored_duplicates,
+        "errors": errors,
+        "total_lines": len(lines),
+        "processed": len(lines) - len(errors),
+    }
+
+@router.post("/refreshjson")
+def bulk_refresh_cookies_json(
     payload: BulkRefreshPayload,
     db: Session = Depends(get_db),
 ):
@@ -244,14 +443,17 @@ def bulk_refresh_cookies(
             acc.pass_enc = pass_enc
             acc.cookie_enc = cookie_enc
             acc.status = final_status
+
             if item.vps_node is not None:
                 acc.vps_node = item.vps_node
             if item.note is not None:
                 acc.note = item.note
             if item.stock is not None:
                 acc.stock = item.stock
+
             db.add(acc)
             updated += 1
+
         else:
             acc = CookieAccount(
                 username=item.username,
@@ -267,6 +469,7 @@ def bulk_refresh_cookies(
 
     db.commit()
     return {"updated": updated, "inserted": inserted}
+
 
 
 # --- EXPORT: CSV for spreadsheet sync ---
@@ -324,21 +527,307 @@ def export_cookie_accounts_csv(
         },
     )
 
+@router.post("/check-cookies")
+def check_cookies(
+    status: str | None = "live",
+    db: Session = Depends(get_db)
+):
+    """
+    Checa cookies da VPS1.
 
-# --- NEW: endpoint that runs the .exe and updates statuses ---
+    - Sem parâmetro => usa status="live"
+    - Com parâmetro => usa o status passado no query param ?status=
+    """
 
-@router.post("/check-cookies", response_model=CookieCheckSummary)
-def check_cookies_and_update_statuses(
+    try:
+        result = run_cookie_checker(db, status_filter=status)
+        return {
+            "detail": "Verificação concluída",
+            "status_filter": status,
+            "result": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@router.get("/done-no-stock", response_model=List[CookieAccountOut])
+def list_done_without_stock(
     db: Session = Depends(get_db),
 ):
     """
-    Runs the external .exe, parses live/dead/banned cookies,
-    and updates their status in the DB.
+    Retorna todas as contas com:
+    - status = 'done'
+    - stock vazio ou null
     """
-    try:
-        results = collect_checker_results()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"cookie checker failed: {e}")
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.status == "done")
+        .where(
+            (CookieAccount.stock == None) | (CookieAccount.stock == "")
+        )
+    )
 
-    summary = apply_checker_results_to_db(db, results)
-    return {"updated": summary}
+    rows = db.scalars(stmt).all()
+    return rows
+
+## note coding
+from pydantic import BaseModel
+
+class NoteUpdate(BaseModel):
+    note: str
+
+
+@router.patch("/cookie/note/{username}", response_model=CookieAccountOut)
+def update_note_single(
+    username: str,
+    payload: NoteUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza o note de uma conta específica.
+    """
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+
+    acc.note = payload.note
+
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return acc
+class NoteBulkUpdate(BaseModel):
+    usernames: List[str]
+    note: str
+
+
+@router.patch("/cookie/note-bulk")
+def update_note_bulk(
+    payload: NoteBulkUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza o note de várias contas ao mesmo tempo.
+    Todas recebem a MESMA note.
+    """
+    updated = 0
+    not_found = []
+
+    for username in payload.usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.note = payload.note
+        db.add(acc)
+        updated += 1
+
+    db.commit()
+
+    return {
+        "updated": updated,
+        "not_found": not_found,
+        "applied_note": payload.note
+    }
+
+@router.get("/stocks", response_model=List[str])
+def list_all_stocks(
+    db: Session = Depends(get_db),
+):
+    """
+    Lista todos os valores de stock registrados (DISTINCT),
+    ignorando NULL ou string vazia.
+    """
+    stmt = (
+        select(CookieAccount.stock)
+        .where(CookieAccount.stock.isnot(None))
+        .where(CookieAccount.stock != "")
+    )
+
+    stocks = db.scalars(stmt).all()
+
+    # Remover duplicados mantendo ordem
+    unique_stocks = list(dict.fromkeys(stocks))
+
+    # Converter tudo para string para o response_model
+    return [str(s) for s in unique_stocks]
+
+ACTIVE_STATUSES = ["live", "dead", "locked", "new"]
+
+
+@router.get("/vps-node/none", response_model=List[CookieAccountOut])
+def list_accounts_without_vpsnode(
+    db: Session = Depends(get_db),
+):
+    """
+    Lista TODAS as contas sem vps_node,
+    mas APENAS se o status for: live, dead ou locked.
+    """
+    stmt = (
+        select(CookieAccount)
+        .where(
+            (CookieAccount.vps_node.is_(None)) |
+            (CookieAccount.vps_node == "")
+        )
+        .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+    )
+
+    rows = db.scalars(stmt).all()
+    return rows
+
+
+@router.get("/vps-node/none/count")
+def count_accounts_without_vpsnode(
+    db: Session = Depends(get_db),
+):
+    """
+    Conta contas SEM vps_node, mas APENAS se estiverem com status:
+    live, dead ou locked.
+    """
+    stmt = (
+        select(CookieAccount)
+        .where(
+            (CookieAccount.vps_node.is_(None)) |
+            (CookieAccount.vps_node == "")
+        )
+        .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+    )
+
+    total = db.scalars(stmt).all()
+    return {"count": len(total)}
+
+## -- assign vps
+
+class VPSAssignRequest(BaseModel):
+    username: str
+
+@router.patch("/assign-vps-balanced")
+def assign_vps_balanced(
+    payload: VPSAssignRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Atribui um vps_node balanceado para uma conta SEM vps_node
+    com base na menor carga (live/dead/locked).
+    """
+
+    ACTIVE_STATUSES = ["live", "dead", "locked"]
+
+    # Buscar conta alvo
+    acc = _get_account_by_username(db, payload.username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+
+    # Se já tem vps_node, não mexe
+    if acc.vps_node not in [None, ""]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Account already has vps_node '{acc.vps_node}'"
+        )
+
+    # Buscar lista de VPS nodes registrados
+    vps_nodes = db.execute(select(VPSNode)).scalars().all()
+    if not vps_nodes:
+        raise HTTPException(status_code=400, detail="No VPS nodes registered")
+
+    # Contar quantas contas cada VPS já possui
+    usage = {}
+    for node in vps_nodes:
+        count_stmt = (
+            select(CookieAccount)
+            .where(CookieAccount.vps_node == node.name)
+            .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+        )
+        count = len(db.scalars(count_stmt).all())
+        usage[node.name] = count
+
+    # Escolher VPS com menor carga
+    chosen_vps = min(usage, key=usage.get)
+
+    # Aplicar
+    acc.vps_node = chosen_vps
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+
+    return {
+        "assigned_to": chosen_vps,
+        "usage_before": usage,
+        "updated_account": acc.username
+    }
+
+@router.patch("/assign-vps-balanced/bulk")
+def assign_vps_balanced_bulk(
+    db: Session = Depends(get_db),
+):
+    """
+    Atribui vps_node balanceado para TODAS as contas sem vps_node.
+    Considera status: live, dead, locked.
+    Retorna balanço antes/depois e contas atualizadas.
+    """
+
+    ACTIVE_STATUSES = ["live", "dead", "locked"]
+
+    # Buscar todos os VPS nodes registrados
+    vps_nodes = db.execute(select(VPSNode)).scalars().all()
+    if not vps_nodes:
+        raise HTTPException(status_code=400, detail="No VPS nodes registered")
+
+    # ---- CONTAGEM ANTERIOR ----
+    usage_before = {}
+    for node in vps_nodes:
+        stmt = (
+            select(CookieAccount)
+            .where(CookieAccount.vps_node == node.name)
+            .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+        )
+        usage_before[node.name] = len(db.scalars(stmt).all())
+
+    # ---- BUSCAR CONTAS SEM vps_node ----
+    stmt_missing = (
+        select(CookieAccount)
+        .where((CookieAccount.vps_node.is_(None)) | (CookieAccount.vps_node == ""))
+        .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+    )
+    missing_accounts = db.scalars(stmt_missing).all()
+
+    updated_accounts = []
+
+    # Fazer uma cópia da contagem para usar durante a distribuição
+    usage_dynamic = usage_before.copy()
+
+    # ---- ATRIBUIR VPS PARA CADA CONTA ----
+    for acc in missing_accounts:
+
+        # Escolher VPS com menor carga atual
+        chosen_vps = min(usage_dynamic, key=usage_dynamic.get)
+
+        # Aplicar no objeto
+        acc.vps_node = chosen_vps
+        db.add(acc)
+
+        # Atualizar contador dinâmico
+        usage_dynamic[chosen_vps] += 1
+
+        updated_accounts.append(acc.username)
+
+    db.commit()
+
+    # ---- CONTAGEM FINAL ----
+    usage_after = {}
+    for node in vps_nodes:
+        stmt = (
+            select(CookieAccount)
+            .where(CookieAccount.vps_node == node.name)
+            .where(CookieAccount.status.in_(ACTIVE_STATUSES))
+        )
+        usage_after[node.name] = len(db.scalars(stmt).all())
+
+    return {
+        "total_updated": len(updated_accounts),
+        "accounts_updated": updated_accounts,
+        "usage_before": usage_before,
+        "usage_after": usage_after,
+    }
