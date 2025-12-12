@@ -52,6 +52,27 @@ def _decrypt_row(row: CookieAccount):
 
 # ---- Endpoints ----
 
+from fastapi.responses import PlainTextResponse
+
+@router.get("/cookie/password/{username}", response_class=PlainTextResponse)
+def get_plain_password(
+    username: str,
+    db: Session = Depends(get_db),
+):
+    """
+    TEMPORÁRIO:
+    Retorna SOMENTE a senha em texto puro.
+    Sem JSON, sem metadata.
+    """
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        return PlainTextResponse("NOT_FOUND", status_code=404)
+
+    plain_password = decrypt_text(acc.pass_enc) or ""
+
+    return PlainTextResponse(plain_password)
+
+
 @router.get("/cookie", response_model=List[CookieAccountOut])
 def list_cookie_accounts(
     status: Optional[str] = Query(None),
@@ -184,10 +205,11 @@ def set_cookie_done(
     return acc
 
 
-# --- set stock
+# --- set stoc
 
 class StockUpdate(BaseModel):
     stock: int | str
+
 @router.patch("/cookie/set-stock/{username}", response_model=CookieAccountOut)
 def update_stock_single(
     username: str,
@@ -210,7 +232,128 @@ def update_stock_single(
     db.refresh(acc)
     return acc
 
+from fastapi import Body
+from fastapi.responses import JSONResponse
 
+from fastapi import Request
+
+@router.patch(
+    "/cookie/set-stock-bulk",
+    response_class=JSONResponse
+)
+async def update_stock_bulk(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    BULK: Atualiza stock de várias contas via text/plain.
+
+        STOCK_AQUI
+        username1
+        username2
+        ...
+    """
+
+    raw_text = (await request.body()).decode("utf-8").strip()
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    stock_value = lines[0]
+    usernames = lines[1:]
+
+    if not usernames:
+        raise HTTPException(status_code=400, detail="No usernames found after stock line")
+
+    updated = 0
+    not_found = []
+    updated_list = []
+
+    for username in usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.stock = stock_value
+        db.add(acc)
+        updated += 1
+        updated_list.append(username)
+
+    db.commit()
+
+    return {
+        "stock_assigned": stock_value,
+        "updated": updated,
+        "updated_usernames": updated_list,
+        "not_found": not_found,
+        "total_received": len(usernames)
+    }
+
+
+
+## note coding
+from pydantic import BaseModel
+
+class NoteUpdate(BaseModel):
+    note: str
+
+
+@router.patch("/cookie/set-note/{username}", response_model=CookieAccountOut)
+def update_note_single(
+    username: str,
+    payload: NoteUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza o note de uma conta específica.
+    """
+    acc = _get_account_by_username(db, username)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Cookie account not found")
+
+    acc.note = payload.note
+
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return acc
+class NoteBulkUpdate(BaseModel):
+    usernames: List[str]
+    note: str
+
+
+@router.patch("/cookie/set-note-bulk")
+def update_note_bulk(
+    payload: NoteBulkUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza o note de várias contas ao mesmo tempo.
+    Todas recebem a MESMA note.
+    """
+    updated = 0
+    not_found = []
+
+    for username in payload.usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.note = payload.note
+        db.add(acc)
+        updated += 1
+
+    db.commit()
+
+    return {
+        "updated": updated,
+        "not_found": not_found,
+        "applied_note": payload.note
+    }
 
 # --- EXPORT: per VPS (for deploying to each node) ---
 
@@ -550,6 +693,75 @@ def check_cookies(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/by-note")
+def get_accounts_by_note(
+    note: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna username + senha plaintext de todas as contas com a note informada.
+    """
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.note == note)
+    )
+
+    rows = db.scalars(stmt).all()
+
+    results = []
+    for row in rows:
+        password = decrypt_text(row.pass_enc) or ""
+        results.append({
+            "username": row.username,
+            "password": password
+        })
+
+    return results
+
+from fastapi.responses import PlainTextResponse
+
+@router.get("/by-note/txt", response_class=PlainTextResponse)
+def get_accounts_by_note_txt(
+    note: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna username:password (plaintext) por linha das contas com a note informada.
+    """
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.note == note)
+    )
+
+    rows = db.scalars(stmt).all()
+
+    lines = []
+    for row in rows:
+        password = decrypt_text(row.pass_enc) or ""
+        lines.append(f"{row.username}:{password}")
+
+    return "\n".join(lines)
+
+
+@router.get("/notes", response_model=List[str])
+def list_all_notes(
+    db: Session = Depends(get_db),
+):
+    """
+    Lista valores DISTINCT de notes,
+    mas SOMENTE de contas onde o stock é NULL ou "".
+    """
+    stmt = (
+        select(CookieAccount.note)
+        .where(CookieAccount.note.isnot(None))
+        .where(CookieAccount.note != "")
+        .where((CookieAccount.stock.is_(None)) | (CookieAccount.stock == ""))
+    )
+
+    notes = db.scalars(stmt).all()
+
+    unique_notes = list(dict.fromkeys(notes))
+    return [str(s) for s in unique_notes]
 
 @router.get("/done-no-stock", response_model=List[CookieAccountOut])
 def list_done_without_stock(
@@ -570,67 +782,6 @@ def list_done_without_stock(
 
     rows = db.scalars(stmt).all()
     return rows
-
-## note coding
-from pydantic import BaseModel
-
-class NoteUpdate(BaseModel):
-    note: str
-
-
-@router.patch("/cookie/note/{username}", response_model=CookieAccountOut)
-def update_note_single(
-    username: str,
-    payload: NoteUpdate,
-    db: Session = Depends(get_db),
-):
-    """
-    Atualiza o note de uma conta específica.
-    """
-    acc = _get_account_by_username(db, username)
-    if not acc:
-        raise HTTPException(status_code=404, detail="Cookie account not found")
-
-    acc.note = payload.note
-
-    db.add(acc)
-    db.commit()
-    db.refresh(acc)
-    return acc
-class NoteBulkUpdate(BaseModel):
-    usernames: List[str]
-    note: str
-
-
-@router.patch("/cookie/note-bulk")
-def update_note_bulk(
-    payload: NoteBulkUpdate,
-    db: Session = Depends(get_db),
-):
-    """
-    Atualiza o note de várias contas ao mesmo tempo.
-    Todas recebem a MESMA note.
-    """
-    updated = 0
-    not_found = []
-
-    for username in payload.usernames:
-        acc = _get_account_by_username(db, username)
-        if not acc:
-            not_found.append(username)
-            continue
-
-        acc.note = payload.note
-        db.add(acc)
-        updated += 1
-
-    db.commit()
-
-    return {
-        "updated": updated,
-        "not_found": not_found,
-        "applied_note": payload.note
-    }
 
 @router.get("/stocks", response_model=List[str])
 def list_all_stocks(
@@ -653,6 +804,8 @@ def list_all_stocks(
 
     # Converter tudo para string para o response_model
     return [str(s) for s in unique_stocks]
+
+
 
 ACTIVE_STATUSES = ["live", "dead", "locked", "new"]
 
@@ -830,4 +983,178 @@ def assign_vps_balanced_bulk(
         "accounts_updated": updated_accounts,
         "usage_before": usage_before,
         "usage_after": usage_after,
+    }
+
+class VPSNodeReset(BaseModel):
+    vps_node: str
+
+
+@router.patch("/vps-node/reset")
+def reset_vpsnode_to_null(
+    payload: VPSNodeReset,
+    db: Session = Depends(get_db),
+):
+    """
+    TEMPORÁRIO:
+    Seta vps_node = NULL para todas as contas que possuem o vps_node especificado.
+    """
+    target_node = payload.vps_node
+
+    stmt = (
+        db.query(CookieAccount)
+        .filter(CookieAccount.vps_node == target_node)
+    )
+
+    affected = stmt.update(
+        {CookieAccount.vps_node: None},
+        synchronize_session=False
+    )
+
+    db.commit()
+
+    return {
+        "cleared": affected,
+        "target_node": target_node
+    }
+
+from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import Query
+from app.utils.crypto import decrypt_text
+
+@router.get("/export/ggmax", response_class=PlainTextResponse)
+def export_marketplace_ggmax(
+    note: str = Query(..., description="Filtrar contas pelo campo note"),
+    db: Session = Depends(get_db),
+):
+    """
+    Exportação para GGMAX.
+    - Apenas contas com status='done'
+    - stock = NULL
+    - note == <param>
+    """
+
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.status == "done")
+        .where((CookieAccount.stock.is_(None)) | (CookieAccount.stock == ""))
+        .where(CookieAccount.note == note)
+    )
+
+    rows = db.scalars(stmt).all()
+
+    if not rows:
+        return ""
+
+    output_lines = []
+    for row in rows:
+        password = decrypt_text(row.pass_enc) or ""
+        output_lines.append(f"Usuário: {row.username}")
+        output_lines.append(f"Senha: {password}")
+        output_lines.append("-=-=-=-")
+
+    return "\n".join(output_lines)
+
+ELDORADO_TEMPLATE = (
+    "Hello, thanks for the purchase! 💖\n"
+    "Account details 👇\n\n"
+    "Username: {username}\n"
+    "Password: {password}\n\n"
+    "Account Unverified Email 📩❌\n"
+    "Please add your own email to the account for preventing losses.\n\n"
+    "If you can leave a review help so much! ✨"
+)
+
+@router.get("/export/eldorado", response_class=PlainTextResponse)
+def export_marketplace_eldorado(
+    note: str = Query(..., description="Filtrar contas pelo campo note"),
+    db: Session = Depends(get_db),
+):
+    """
+    Exportação para Eldorado.
+    - Resposta em texto puro
+    - Apenas contas com status='done'
+    - stock = NULL
+    - note == <param>
+    - Cada conta separada por -------
+    """
+
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.status == "done")
+        .where((CookieAccount.stock.is_(None)) | (CookieAccount.stock == ""))
+        .where(CookieAccount.note == note)
+    )
+
+    rows = db.scalars(stmt).all()
+
+    if not rows:
+        return ""
+
+    output_lines = []
+
+    for row in rows:
+        password = decrypt_text(row.pass_enc) or ""
+
+        formatted = (
+            "Hello, thanks for the purchase! 💖\n"
+            "Account details 👇\n\n"
+            f"Username: {row.username}\n"
+            f"Password: {password}\n\n"
+            "Account Unverified Email 📩❌\n"
+            "Please add your own email to the account for preventing losses.\n\n"
+            "If you can leave a review help so much! ✨"
+        )
+
+        output_lines.append(formatted)
+        output_lines.append("-------")  # separador para você apagar depois
+
+    return "\n".join(output_lines)
+
+
+@router.post("/set-stock-after-export")
+def bulk_set_stock_after_export(
+    note: str = Query(..., description="Filtrar contas pelo campo note"),
+    marketplace: str = Query(..., description="Nome do marketplace ex: ggmax, eldorado, etc."),
+    db: Session = Depends(get_db),
+):
+    """
+    Atualiza o campo 'stock' de todas as contas exportadas para marketplace.
+    Regras:
+    - status = 'done'
+    - stock = NULL
+    - note = <note>
+    """
+
+    # Query de contas elegíveis
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.status == "done")
+        .where((CookieAccount.stock.is_(None)) | (CookieAccount.stock == ""))
+        .where(CookieAccount.note == note)
+    )
+
+    accounts = db.scalars(stmt).all()
+
+    if not accounts:
+        return {
+            "updated": 0,
+            "marketplace": marketplace,
+            "note": note,
+            "message": "Nenhuma conta elegível encontrada."
+        }
+
+    updated_users = []
+
+    for acc in accounts:
+        acc.stock = marketplace  # marca o marketplace onde foi vendida/registrada
+        db.add(acc)
+        updated_users.append(acc.username)
+
+    db.commit()
+
+    return {
+        "updated": len(updated_users),
+        "marketplace": marketplace,
+        "note": note,
+        "affected_usernames": updated_users
     }
