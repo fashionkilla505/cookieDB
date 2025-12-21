@@ -1158,3 +1158,221 @@ def bulk_set_stock_after_export(
         "note": note,
         "affected_usernames": updated_users
     }
+
+
+from fastapi import Body
+from fastapi.responses import JSONResponse
+
+@router.post(
+    "/cookie/set-done-bulk",
+    response_class=JSONResponse
+)
+def set_cookie_done_bulk(
+    raw_text: str = Body(
+        ...,
+        media_type="text/plain",
+        example="username1\nusername2\nusername3"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    BULK: Marca várias contas como 'done' via text/plain.
+
+        username1
+        username2
+        username3
+    """
+
+    raw_text = raw_text.strip()
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    usernames = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    updated = 0
+    updated_usernames = []
+    not_found = []
+
+    for username in usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.status = "done"
+        db.add(acc)
+        updated += 1
+        updated_usernames.append(username)
+
+    db.commit()
+
+    return {
+        "total_received": len(usernames),
+        "updated": updated,
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+    }
+
+from pydantic import BaseModel
+from typing import List
+
+# ---- Schema de resposta ----
+class UsernamesResponse(BaseModel):
+    usernames: List[str]
+
+
+@router.get(
+    "/done-no-stock/usernames",
+    response_model=UsernamesResponse
+)
+def list_done_without_stock_usernames(
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna SOMENTE usernames das contas com:
+    - status = 'done'
+    - stock NULL ou vazio
+
+    Formato:
+    {
+        "usernames": ["aaaa", "bbbb", "ccccc"]
+    }
+    """
+
+    stmt = (
+        select(CookieAccount.username)
+        .where(CookieAccount.status == "done")
+        .where(
+            (CookieAccount.stock.is_(None)) |
+            (CookieAccount.stock == "")
+        )
+    )
+
+    usernames = db.scalars(stmt).all()
+
+    return {"usernames": usernames}
+
+from pydantic import BaseModel
+from typing import List
+from fastapi.responses import JSONResponse
+
+
+class NoteBulkJSON(BaseModel):
+    usernames: List[str]
+    note: str
+
+from pydantic import BaseModel
+from typing import List
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+
+
+class NoteBulkJSON(BaseModel):
+    usernames: List[str]
+    note: str
+
+
+@router.patch(
+    "/set-noteaaaaaaaa",
+    response_class=JSONResponse
+)
+def update_note_bulk_json(
+    payload: NoteBulkJSON,
+    db: Session = Depends(get_db),
+):
+    """
+    BULK (JSON): Atualiza o note de várias contas.
+    Nunca falha por username inexistente.
+    """
+
+    if not payload.usernames:
+        return {
+            "updated": 0,
+            "not_found": [],
+            "note_applied": payload.note,
+            "message": "Empty usernames list"
+        }
+
+    # 🔹 buscar todas de uma vez
+    stmt = (
+        select(CookieAccount)
+        .where(CookieAccount.username.in_(payload.usernames))
+    )
+    accounts = db.scalars(stmt).all()
+
+    found_usernames = set()
+    updated_usernames = []
+
+    for acc in accounts:
+        acc.note = payload.note
+        db.add(acc)
+        found_usernames.add(acc.username)
+        updated_usernames.append(acc.username)
+
+    db.commit()
+
+    not_found = [
+        u for u in payload.usernames
+        if u not in found_usernames
+    ]
+
+    return {
+        "note_applied": payload.note,
+        "total_received": len(payload.usernames),
+        "updated": len(updated_usernames),
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+    }
+
+
+@router.post(
+    "/cookie/set-oldstock-bulk",
+    response_class=JSONResponse
+)   
+def set_cookie_done_bulk(
+    raw_text: str = Body(
+        ...,
+        media_type="text/plain",
+        example="username1\nusername2\nusername3"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    BULK: Marca várias contas como 'done' via text/plain.
+
+        username1
+        username2
+        username3
+    """
+
+    raw_text = raw_text.strip()
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    usernames = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    updated = 0
+    updated_usernames = []
+    not_found = []
+
+    for username in usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.status = "oldstock"
+        db.add(acc)
+        updated += 1
+        updated_usernames.append(username)
+
+    db.commit()
+
+    return {
+        "total_received": len(usernames),
+        "updated": updated,
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+    }

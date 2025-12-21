@@ -3,7 +3,7 @@ from typing import Optional, Literal, List, Annotated, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict, BeforeValidator
 
-StatusLiteral = Literal["new", "live", "dead", "banned", "expired", "invalid", "locked", "recovered", "done"]
+StatusLiteral = Literal["new", "live", "dead", "banned", "expired", "invalid", "locked", "recovered", "done", "oldstock"]
 
 def _normalize_status(value: str) -> str:
     if value is None:
@@ -12,7 +12,7 @@ def _normalize_status(value: str) -> str:
     if not isinstance(value, str):
         return value
     v = value.lower()
-    allowed = {"new", "live", "dead", "banned", "expired", "invalid", "locked", "recovered", "done",}
+    allowed = {"new", "live", "dead", "banned", "expired", "invalid", "locked", "recovered", "done", "oldstock"}
     if v not in allowed:
         # will become a validation error
         raise ValueError(f"Invalid status '{value}'. Allowed: {sorted(allowed)}")
