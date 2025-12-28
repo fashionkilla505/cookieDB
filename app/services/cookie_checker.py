@@ -117,6 +117,16 @@ def _update_statuses(db: Session, mapped: Dict[str, Set[str]]) -> Dict[str, int]
     db.commit()
     return stats
 
+def _clear_remote_status_files(conn: VPSConnection):
+    """
+    Remove os arquivos de status antigos (live/dead/banned) na VPS
+    antes de executar o checker.
+    """
+    for name, path in STATUS_FILES.items():
+        # del não falha se o arquivo não existir quando usado com if exist
+        cmd = f'if exist "{path}" del /F /Q "{path}"'
+        conn.run(cmd)
+
 
 def run_cookie_checker(db: Session, status_filter: str = "live"):
 
@@ -146,8 +156,11 @@ def run_cookie_checker(db: Session, status_filter: str = "live"):
             working_directory=node.working_directory,
         ) as conn:
 
+            # 🔥 LIMPA arquivos antigos (live/dead/banned)
+            _clear_remote_status_files(conn)
+
             # Upload do cookie.txt
-            _upload_cookie_txt(conn, cookie_text)
+            _upload_cookie_txt(conn, cookie_text)   
 
             # Executar a scheduled task
             conn.run(f'schtasks /RUN /TN "{COOKIE_CHECK_TASK_NAME}"')

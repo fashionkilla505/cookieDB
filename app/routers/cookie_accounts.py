@@ -1327,6 +1327,108 @@ def update_note_bulk_json(
 
 
 @router.post(
+    "/cookie/set-banned-bulk",
+    response_class=JSONResponse
+)   
+def set_cookie_done_bulk(
+    raw_text: str = Body(
+        ...,
+        media_type="text/plain",
+        example="username1\nusername2\nusername3"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    BULK: Marca várias contas como 'banned' via text/plain.
+
+        username1
+        username2
+        username3
+    """
+
+    raw_text = raw_text.strip()
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    usernames = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    updated = 0
+    updated_usernames = []
+    not_found = []
+
+    for username in usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.status = "banned"
+        db.add(acc)
+        updated += 1
+        updated_usernames.append(username)
+
+    db.commit()
+
+    return {
+        "total_received": len(usernames),
+        "updated": updated,
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+    }
+
+@router.post(
+    "/cookie/set-live-bulk",
+    response_class=JSONResponse
+)   
+def set_cookie_done_bulk(
+    raw_text: str = Body(
+        ...,
+        media_type="text/plain",
+        example="username1\nusername2\nusername3"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    BULK: Marca várias contas como 'live' via text/plain.
+
+        username1
+        username2
+        username3
+    """
+
+    raw_text = raw_text.strip()
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    usernames = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    updated = 0
+    updated_usernames = []
+    not_found = []
+
+    for username in usernames:
+        acc = _get_account_by_username(db, username)
+        if not acc:
+            not_found.append(username)
+            continue
+
+        acc.status = "live"
+        db.add(acc)
+        updated += 1
+        updated_usernames.append(username)
+
+    db.commit()
+
+    return {
+        "total_received": len(usernames),
+        "updated": updated,
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+    }
+
+@router.post(
     "/cookie/set-oldstock-bulk",
     response_class=JSONResponse
 )   
@@ -1339,7 +1441,7 @@ def set_cookie_done_bulk(
     db: Session = Depends(get_db),
 ):
     """
-    BULK: Marca várias contas como 'done' via text/plain.
+    BULK: Marca várias contas como 'oldstock' via text/plain.
 
         username1
         username2
