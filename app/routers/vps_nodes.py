@@ -202,6 +202,8 @@ def test_connection(name: str, db: Session = Depends(get_db)):
         "last_sync": node.last_sync,
         "last_sync_status": node.last_sync_status,
     }   
+
+
 @router.post("/{name}/deploy-cookies")
 def deploy_cookies_to_vps(
     name: str,
@@ -222,9 +224,12 @@ def deploy_cookies_to_vps(
         raise HTTPException(status_code=404, detail="VPS node not found")
 
     # 2) Buscar as contas do VPS
-    stmt = select(CookieAccount).where(CookieAccount.vps_node == name)
-    if status:
-        stmt = stmt.where(CookieAccount.status == status)
+    stmt = (
+    select(CookieAccount)
+    .where(CookieAccount.vps_node == name)
+    .where(CookieAccount.status == status)
+    .order_by(CookieAccount.id.asc())
+    )
 
     accounts = db.scalars(stmt).all()
 
@@ -301,7 +306,122 @@ def deploy_cookies_to_vps(
         "accounts_count": len(lines),
         "remote_path": remote_path,
     }
-@router.post("/{name}/kill-yummy")
+
+@router.post("/deploy-cookies-all")
+def deploy_cookies_all_vps(
+    status: str = "live",
+    db: Session = Depends(get_db),
+):
+    """
+    Gera e faz deploy do cookie.txt em TODAS as VPS registradas no banco.
+
+    - Contas filtradas por vps_node == node.name
+    - Filtra por status (default: 'live')
+    - Ordem por created_at ASC (determinística)
+    """
+
+    nodes = db.scalars(select(VPSNode)).all()
+
+    if not nodes:
+        raise HTTPException(status_code=404, detail="No VPS nodes found")
+
+    results: list[dict] = []
+
+    for node in nodes:
+        stdout_steps: list[str] = []
+        stderr_steps: list[str] = []
+
+        try:
+            # 1) Buscar contas da VPS
+            stmt = (
+                select(CookieAccount)
+                .where(CookieAccount.vps_node == node.name)
+                .where(CookieAccount.status == status)
+                .order_by(CookieAccount.id.asc())
+            )
+
+            accounts = db.scalars(stmt).all()
+
+            # 2) Montar conteúdo do .txt
+            lines: list[str] = []
+            for acc in accounts:
+                try:
+                    plain_pass = decrypt_text(acc.pass_enc)
+                    plain_cookie = decrypt_text(acc.cookie_enc)
+                except Exception:
+                    continue
+
+                lines.append(f"{acc.username}:{plain_pass}:{plain_cookie}")
+
+            content = "\n".join(lines) + "\n" if lines else ""
+
+            # 3) Arquivo temporário
+            with tempfile.NamedTemporaryFile(
+                "w+", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            # 4) Caminho remoto
+            base = node.working_directory.replace("\\", "/").rstrip("/")
+            remote_path = f"{base}/cookie.txt"
+
+            # 5) Upload SFTP
+            password = decrypt_text(node.password_enc) if node.password_enc else None
+
+            with VPSConnection(
+                host=node.host,
+                port=node.port,
+                username=node.username,
+                password=password,
+                keyfile=node.keyfile_path,
+                working_directory=node.working_directory,
+            ) as conn:
+                conn.upload(tmp_path, remote_path)
+
+            # sucesso
+            node.last_sync = datetime.utcnow()
+            node.last_sync_status = (
+                f"deploy-cookies ok ({len(lines)} accounts → {remote_path})"
+            )
+
+            result_status = "ok"
+
+        except Exception as e:
+            node.last_sync = datetime.utcnow()
+            node.last_sync_status = f"deploy-cookies error: {e}"
+
+            result_status = "error"
+            stderr_steps.append(str(e))
+
+        finally:
+            # limpeza do arquivo temporário
+            try:
+                if "tmp_path" in locals():
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+            db.add(node)
+            db.commit()
+
+        results.append({
+            "vps": node.name,
+            "status": result_status,
+            "accounts_count": len(lines) if result_status == "ok" else 0,
+            "remote_path": f"{base}/cookie.txt" if result_status == "ok" else None,
+            "stdout": "\n".join(stdout_steps),
+            "stderr": "\n".join(stderr_steps),
+        })
+
+    return {
+        "status": "ok",
+        "action": "deploy-cookies-all",
+        "vps_count": len(nodes),
+        "results": results,
+    }
+
+
 @router.post("/{name}/kill-yummy")
 def kill_yummy(
     name: str,
@@ -472,6 +592,89 @@ def restart_yummy(
         "stdout": "\n".join(stdout_steps),
         "stderr": "\n".join(stderr_steps),
     }
+
+@router.post("/restart-yummy-all")
+def restart_yummy_all(
+    db: Session = Depends(get_db),
+):
+    """
+    Reinicia o yummy manager em TODAS as VPS registradas:
+    - taskkill /IM WebRB.exe /F
+    - schtasks /run /tn "YummyWebRB"
+
+    Retorna resultado por VPS (ok / erro).
+    """
+
+    nodes = db.scalars(select(VPSNode)).all()
+
+    if not nodes:
+        raise HTTPException(status_code=404, detail="No VPS nodes found")
+
+    results: list[dict] = []
+
+    for node in nodes:
+        password = decrypt_text(node.password_enc) if node.password_enc else None
+
+        stop_cmd = f'taskkill /IM "{YUMMY_PROCESS_NAME}" /F'
+        start_cmd = f'schtasks /run /tn "{YUMMY_TASK_NAME}"'
+
+        stdout_steps: list[str] = []
+        stderr_steps: list[str] = []
+
+        try:
+            with VPSConnection(
+                host=node.host,
+                port=node.port,
+                username=node.username,
+                password=password,
+                keyfile=node.keyfile_path,
+                working_directory=node.working_directory,
+            ) as conn:
+                # STOP
+                out_stop, err_stop = conn.run(stop_cmd)
+                stdout_steps.append(f"[STOP]\n{out_stop}")
+                stderr_steps.append(f"[STOP]\n{err_stop}")
+
+                # START
+                out_start, err_start = conn.run(start_cmd)
+                stdout_steps.append(f"[START]\n{out_start}")
+                stderr_steps.append(f"[START]\n{err_start}")
+
+            node.last_sync = datetime.utcnow()
+            node.last_sync_status = (
+                f"restart-yummy ok ({YUMMY_PROCESS_NAME} -> task {YUMMY_TASK_NAME})"
+            )
+
+            result_status = "ok"
+
+        except Exception as e:
+            node.last_sync = datetime.utcnow()
+            node.last_sync_status = f"restart-yummy error: {e}"
+
+            result_status = "error"
+            stderr_steps.append(str(e))
+
+        db.add(node)
+        db.commit()
+
+        results.append({
+            "vps": node.name,
+            "status": result_status,
+            "process_name": YUMMY_PROCESS_NAME,
+            "task_name": YUMMY_TASK_NAME,
+            "stop_command": stop_cmd,
+            "start_command": start_cmd,
+            "stdout": "\n".join(stdout_steps),
+            "stderr": "\n".join(stderr_steps),
+        })
+
+    return {
+        "status": "ok",
+        "action": "restart-yummy-all",
+        "vps_count": len(nodes),
+        "results": results,
+    }
+
 
 @router.get("/{name}/check-yummy")
 def check_yummy(
