@@ -21,6 +21,15 @@ YUMMY_TASK_NAME = "YummyWebRB"
 YUMMY_START_EXE = "WebRB.exe"
 
 
+SELIWARE_PROCESS_NAME = "app.exe"
+SELIWARE_TASK_NAME = "Seliware"
+SELIWARE_START_EXE = "app.exe"
+
+ROBLOX_PROCESS_NAME = "RobloxPlayerBeta.exe"
+FISHTRAP_PROCESS_NAME = "Fishstrap.exe"
+
+
+
 router = APIRouter(prefix="/vps-nodes", tags=["vps-nodes"])
 
 
@@ -739,4 +748,210 @@ def check_yummy(
         "command": check_cmd,
         "stdout": out_check,
         "stderr": err_check,
+    }
+
+@router.post("/{name}/kill-roblox")
+def kill_roblox(
+    name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Mata todos os roblox ativos (RobloxPlayerBeta.exe) na VPS.
+    Usa taskkill /IM RobloxPlayerBeta.exe /F.
+    """
+    node = _get_by_name(db, name)
+    if not node:
+        raise HTTPException(status_code=404, detail="VPS node not found")
+
+    password = decrypt_text(node.password_enc) if node.password_enc else None
+
+    stop_cmd = f'taskkill /IM "{ROBLOX_PROCESS_NAME}" /F'
+
+    try:
+        with VPSConnection(
+            host=node.host,
+            port=node.port,
+            username=node.username,
+            password=password,
+            keyfile=node.keyfile_path,
+            working_directory=node.working_directory,
+        ) as conn:
+            out_stop, err_stop = conn.run(stop_cmd)
+    except Exception as e:
+        node.last_sync = datetime.utcnow()
+        node.last_sync_status = f"kill-roblox error: {e}"
+        db.add(node)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"kill-roblox failed: {e}")
+
+    node.last_sync = datetime.utcnow()
+    node.last_sync_status = (
+        f'kill-roblox ok ({ROBLOX_PROCESS_NAME}) | stdout={out_stop!r} | stderr={err_stop!r}'
+    )
+    db.add(node)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "action": "kill-roblox",
+        "vps": name,
+        "process_name": ROBLOX_PROCESS_NAME,
+        "command": stop_cmd,
+        "stdout": out_stop,
+        "stderr": err_stop,
+    }
+
+@router.post("/{name}/kill-fishtrap")
+def kill_fishtrap(
+    name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Mata todos os roblox ativos (RobloxPlayerBeta.exe) e o Processo FISHTRAP na VPS.
+    Usa taskkill /IM RobloxPlayerBeta.exe /F.
+    """
+    node = _get_by_name(db, name)
+    if not node:
+        raise HTTPException(status_code=404, detail="VPS node not found")
+
+    password = decrypt_text(node.password_enc) if node.password_enc else None
+
+    stop_cmd = f'taskkill /IM "{ROBLOX_PROCESS_NAME}" /F & taskkill /IM "{FISHTRAP_PROCESS_NAME}" /F'
+
+    try:
+        with VPSConnection(
+            host=node.host,
+            port=node.port,
+            username=node.username,
+            password=password,
+            keyfile=node.keyfile_path,
+            working_directory=node.working_directory,
+        ) as conn:
+            out_stop, err_stop = conn.run(stop_cmd)
+    except Exception as e:
+        node.last_sync = datetime.utcnow()
+        node.last_sync_status = f"kill-fishtrap error: {e}"
+        db.add(node)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"kill-fishtrap failed: {e}")
+
+    node.last_sync = datetime.utcnow()
+    node.last_sync_status = (
+        f'kill-fishtrap ok ({FISHTRAP_PROCESS_NAME}) | stdout={out_stop!r} | stderr={err_stop!r}'
+    )
+    db.add(node)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "action": "kill-fishtrap",
+        "vps": name,
+        "process_name": ROBLOX_PROCESS_NAME,
+        "command": stop_cmd,
+        "stdout": out_stop,
+        "stderr": err_stop,
+    }
+
+@router.post("/{name}/kill-seliware")
+def kill_seliware(
+    name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Mata o SELIWARE - Processo app.exe na VPS.
+    Usa taskkill /IM app.exe /F.
+    """
+    node = _get_by_name(db, name)
+    if not node:
+        raise HTTPException(status_code=404, detail="VPS node not found")
+
+    password = decrypt_text(node.password_enc) if node.password_enc else None
+
+    stop_cmd = f'taskkill /IM "{SELIWARE_PROCESS_NAME}" /F'
+
+    try:
+        with VPSConnection(
+            host=node.host,
+            port=node.port,
+            username=node.username,
+            password=password,
+            keyfile=node.keyfile_path,
+            working_directory=node.working_directory,
+        ) as conn:
+            out_stop, err_stop = conn.run(stop_cmd)
+    except Exception as e:
+        node.last_sync = datetime.utcnow()
+        node.last_sync_status = f"kill-seliware error: {e}"
+        db.add(node)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"kill-seliware failed: {e}")
+
+    node.last_sync = datetime.utcnow()
+    node.last_sync_status = (
+        f'kill-seliware ok ({SELIWARE_PROCESS_NAME}) | stdout={out_stop!r} | stderr={err_stop!r}'
+    )
+    db.add(node)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "action": "kill-seliware",
+        "vps": name,
+        "process_name": SELIWARE_PROCESS_NAME,
+        "command": stop_cmd,
+        "stdout": out_stop,
+        "stderr": err_stop,
+    }
+
+@router.post("/{name}/start-seliware")
+def start_seliware(
+    name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Inicia o Seliware via Scheduled Task.
+    Supõe que exista uma task agendada chamada SELIWARE_TASK_NAME (ex.: "Seliware")
+    configurada para rodar o WebRB.exe com o usuário logado.
+    """
+    node = _get_by_name(db, name)
+    if not node:
+        raise HTTPException(status_code=404, detail="VPS node not found")
+
+    password = decrypt_text(node.password_enc) if node.password_enc else None
+
+    # Comando simples: dispara a tarefa agendada
+    start_cmd = f'schtasks /run /tn "{SELIWARE_TASK_NAME}"'
+
+    try:
+        with VPSConnection(
+            host=node.host,
+            port=node.port,
+            username=node.username,
+            password=password,
+            keyfile=node.keyfile_path,
+            working_directory=node.working_directory,
+        ) as conn:
+            out_start, err_start = conn.run(start_cmd)
+    except Exception as e:
+        node.last_sync = datetime.utcnow()
+        node.last_sync_status = f"start-seliware error: {e}"
+        db.add(node)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"start-seliware failed: {e}")
+
+    node.last_sync = datetime.utcnow()
+    node.last_sync_status = (
+        f"start-seliware ok (task={SELIWARE_TASK_NAME}) | stdout={out_start!r} | stderr={err_start!r}"
+    )
+    db.add(node)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "action": "start-seliware",
+        "vps": name,
+        "task_name": SELIWARE_TASK_NAME,
+        "command": start_cmd,
+        "stdout": out_start,
+        "stderr": err_start,
     }
